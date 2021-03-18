@@ -40,7 +40,7 @@ import (
 	"tailscale.com/wgengine/tstun"
 )
 
-const debugNetstack = false
+const debugNetstack = true
 
 // Impl contains the state for the netstack implementation,
 // and implements wgengine.FakeImpl to act as a userspace network
@@ -75,10 +75,12 @@ func Create(logf logger.Logf, tundev *tstun.TUN, e wgengine.Engine, mc *magicsoc
 		return nil, errors.New("nil Engine")
 	}
 	ipstack := stack.New(stack.Options{
+		HandleLocal:        false,
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4, icmp.NewProtocol6},
 	})
 	linkEP := channel.New(512, mtu, "")
+	linkEP.LinkEPCapabilities |= stack.CapabilityLoopback
 	if tcpipProblem := ipstack.CreateNIC(nicID, linkEP); tcpipProblem != nil {
 		return nil, fmt.Errorf("could not create netstack NIC: %v", tcpipProblem)
 	}
@@ -86,7 +88,13 @@ func Create(logf logger.Logf, tundev *tstun.TUN, e wgengine.Engine, mc *magicsoc
 	// are handled by the one fake NIC we use.
 	ipv4Subnet, _ := tcpip.NewSubnet(tcpip.Address(strings.Repeat("\x00", 4)), tcpip.AddressMask(strings.Repeat("\x00", 4)))
 	ipv6Subnet, _ := tcpip.NewSubnet(tcpip.Address(strings.Repeat("\x00", 16)), tcpip.AddressMask(strings.Repeat("\x00", 16)))
+	testSubnet, _ := tcpip.NewSubnet(tcpip.Address(net.ParseIP("192.0.2.0")), tcpip.AddressMask(net.ParseIP("255.255.255.0")))
 	ipstack.SetRouteTable([]tcpip.Route{
+		{
+			Destination: testSubnet,
+			Gateway:     tcpip.Address(net.ParseIP("192.0.2.255")),
+			NIC:         nicID,
+		},
 		{
 			Destination: ipv4Subnet,
 			NIC:         nicID,
@@ -156,50 +164,72 @@ func (ns *Impl) updateDNS(nm *netmap.NetworkMap) {
 	ns.dns = DNSMapFromNetworkMap(nm)
 }
 
+func addressWithPrefixToIPPrefix(awp tcpip.AddressWithPrefix) (netaddr.IPPrefix, bool) {
+	ip, ok := netaddr.FromStdIP(net.IP(awp.Address))
+	if !ok {
+		return netaddr.IPPrefix{}, false
+	}
+	return netaddr.IPPrefix{
+		IP:   ip,
+		Bits: uint8(awp.PrefixLen),
+	}, true
+}
+
+func ipPrefixToAddressWithPrefix(ipp netaddr.IPPrefix) tcpip.AddressWithPrefix {
+	return tcpip.AddressWithPrefix{
+		Address:   tcpip.Address(ipp.IP.IPAddr().IP),
+		PrefixLen: int(ipp.Bits),
+	}
+}
+
 func (ns *Impl) updateIPs(nm *netmap.NetworkMap) {
 	ns.updateDNS(nm)
 
-	oldIPs := make(map[tcpip.Address]bool)
-	for _, ip := range ns.ipstack.AllAddresses()[nicID] {
-		oldIPs[ip.AddressWithPrefix.Address] = true
+	oldIPs := make(map[tcpip.AddressWithPrefix]bool)
+	for _, protocolAddr := range ns.ipstack.AllAddresses()[nicID] {
+		oldIPs[protocolAddr.AddressWithPrefix] = true
 	}
-	newIPs := make(map[tcpip.Address]bool)
-	for _, ip := range nm.Addresses {
-		newIPs[tcpip.Address(ip.IP.IPAddr().IP)] = true
+	newIPs := make(map[tcpip.AddressWithPrefix]bool)
+	for _, ipp := range nm.Addresses {
+		newIPs[ipPrefixToAddressWithPrefix(ipp)] = true
 	}
 
-	ipsToBeAdded := make(map[tcpip.Address]bool)
-	for ip := range newIPs {
-		if !oldIPs[ip] {
-			ipsToBeAdded[ip] = true
+	ipsToBeAdded := make(map[tcpip.AddressWithPrefix]bool)
+	for ipp := range newIPs {
+		if !oldIPs[ipp] {
+			ipsToBeAdded[ipp] = true
 		}
 	}
-	ipsToBeRemoved := make(map[tcpip.Address]bool)
+	ipsToBeAdded[tcpip.AddressWithPrefix{
+		Address:   tcpip.Address(net.ParseIP("192.0.2.0").To4()),
+		PrefixLen: 24,
+	}] = true
+	ipsToBeRemoved := make(map[tcpip.AddressWithPrefix]bool)
 	for ip := range oldIPs {
 		if !newIPs[ip] {
 			ipsToBeRemoved[ip] = true
 		}
 	}
 
-	for ip := range ipsToBeRemoved {
-		err := ns.ipstack.RemoveAddress(nicID, ip)
+	for ipp := range ipsToBeRemoved {
+		err := ns.ipstack.RemoveAddress(nicID, ipp.Address)
 		if err != nil {
-			ns.logf("netstack: could not deregister IP %s: %v", ip, err)
+			ns.logf("netstack: could not deregister IP %s: %v", ipp, err)
 		} else {
-			ns.logf("[v2] netstack: deregistered IP %s", ip)
+			ns.logf("[v2] netstack: deregistered IP %s", ipp)
 		}
 	}
-	for ip := range ipsToBeAdded {
+	for ipp := range ipsToBeAdded {
 		var err tcpip.Error
-		if ip.To4() == "" {
-			err = ns.ipstack.AddAddress(nicID, ipv6.ProtocolNumber, ip)
+		if ipp.Address.To4() == "" {
+			err = ns.ipstack.AddAddressWithPrefix(nicID, ipv6.ProtocolNumber, ipp)
 		} else {
-			err = ns.ipstack.AddAddress(nicID, ipv4.ProtocolNumber, ip)
+			err = ns.ipstack.AddAddressWithPrefix(nicID, ipv4.ProtocolNumber, ipp)
 		}
 		if err != nil {
-			ns.logf("netstack: could not register IP %s: %v", ip, err)
+			ns.logf("netstack: could not register IP %s: %v", ipp, err)
 		} else {
-			ns.logf("[v2] netstack: registered IP %s", ip)
+			ns.logf("[v2] netstack: registered IP %s", ipp)
 		}
 	}
 }
@@ -328,19 +358,19 @@ func (ns *Impl) acceptTCP(r *tcp.ForwarderRequest) {
 		r.Complete(true)
 		return
 	}
-	localAddr, err := ep.GetLocalAddress()
+	dialAddr, err := ep.GetLocalAddress()
 	if err != nil {
 		r.Complete(true)
 		return
 	}
 	r.Complete(false)
 	c := gonet.NewTCPConn(&wq, ep)
-	go ns.forwardTCP(c, &wq, localAddr.Port)
+	go ns.forwardTCP(c, &wq, dialAddr)
 }
 
-func (ns *Impl) forwardTCP(client *gonet.TCPConn, wq *waiter.Queue, port uint16) {
+func (ns *Impl) forwardTCP(client *gonet.TCPConn, wq *waiter.Queue, dialAddr tcpip.FullAddress) {
 	defer client.Close()
-	ns.logf("[v2] netstack: forwarding incoming connection on port %v", port)
+	ns.logf("[v2] netstack: forwarding incoming connection to %s", dialAddr)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	waitEntry, notifyCh := waiter.NewChannelEntry(nil)
@@ -358,9 +388,9 @@ func (ns *Impl) forwardTCP(client *gonet.TCPConn, wq *waiter.Queue, port uint16)
 		cancel()
 	}()
 	var stdDialer net.Dialer
-	server, err := stdDialer.DialContext(ctx, "tcp", net.JoinHostPort("localhost", strconv.Itoa(int(port))))
+	server, err := stdDialer.DialContext(ctx, "tcp", net.JoinHostPort("localhost", strconv.Itoa(int(dialAddr.Port))))
 	if err != nil {
-		ns.logf("netstack: could not connect to local server on port %v: %v", port, err)
+		ns.logf("netstack: could not connect to local server at: %v", dialAddr, err)
 		return
 	}
 	defer server.Close()
@@ -382,7 +412,7 @@ func (ns *Impl) forwardTCP(client *gonet.TCPConn, wq *waiter.Queue, port uint16)
 	if err != nil {
 		ns.logf("proxy connection closed with error: %v", err)
 	}
-	ns.logf("[v2] netstack: forwarder connection on port %v closed", port)
+	ns.logf("[v2] netstack: forwarder connection to %s closed", dialAddr)
 }
 
 func (ns *Impl) acceptUDP(r *udp.ForwarderRequest) {
