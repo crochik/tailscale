@@ -358,6 +358,7 @@ func (c *Direct) doLogin(ctx context.Context, t *oauth2.Token, flags LoginFlags,
 		NodeKey:    tailcfg.NodeKey(tryingNewKey.Public()),
 		Hostinfo:   hostinfo,
 		Followup:   url,
+		Timestamp:  time.Now(),
 	}
 	c.logf("RegisterReq: onode=%v node=%v fup=%v",
 		request.OldNodeKey.ShortString(),
@@ -366,6 +367,15 @@ func (c *Direct) doLogin(ctx context.Context, t *oauth2.Token, flags LoginFlags,
 	request.Auth.Provider = persist.Provider
 	request.Auth.LoginName = persist.LoginName
 	request.Auth.AuthKey = authKey
+	err = signRegisterRequest(&request, c.serverURL, c.serverKey, c.machinePrivKey.Public())
+	switch err {
+	case nil:
+		// Success
+	case errCertificateNotConfigured, errNoCertStore:
+		// The feature is disabled, no need to log
+	default:
+		c.logf("RegisterReq unsigned: %v", err)
+	}
 	bodyData, err := encode(request, &serverKey, &c.machinePrivKey)
 	if err != nil {
 		return regen, url, err

@@ -8,8 +8,10 @@ package tailcfg
 
 import (
 	"bytes"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"strings"
 	"time"
@@ -20,6 +22,7 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/opt"
 	"tailscale.com/types/structs"
+	"tailscale.com/types/wgkey"
 	"tailscale.com/util/dnsname"
 )
 
@@ -555,9 +558,16 @@ type RegisterRequest struct {
 		Oauth2Token         *oauth2.Token
 		AuthKey             string
 	}
-	Expiry   time.Time // requested key expiry, server policy may override
-	Followup string    // response waits until AuthURL is visited
-	Hostinfo *Hostinfo
+	Expiry     time.Time // requested key expiry, server policy may override
+	Followup   string    // response waits until AuthURL is visited
+	Hostinfo   *Hostinfo
+	DeviceCert []byte    // X.509 certificate for client device; optional
+	Timestamp  time.Time // request creation time to prevent replay
+	// Signature is computed as RSA-PSS-Sign(privateKeyForDeviceCert,
+	// Timestamp || ServerIdentity || DeviceCert || ServerPubKey ||
+	// MachinePubKey); optional
+	Signature          []byte
+	SignatureAlgorithm x509.SignatureAlgorithm
 }
 
 // Clone makes a deep copy of RegisterRequest.
@@ -574,7 +584,45 @@ func (req *RegisterRequest) Clone() *RegisterRequest {
 		tok := *res.Auth.Oauth2Token
 		res.Auth.Oauth2Token = &tok
 	}
+	if res.DeviceCert != nil {
+		res.DeviceCert = make([]byte, len(req.DeviceCert))
+		copy(res.DeviceCert, req.DeviceCert)
+	}
+	if res.Signature != nil {
+		res.Signature = make([]byte, len(req.Signature))
+		copy(res.Signature, req.Signature)
+	}
 	return res
+}
+
+// WritePlaintextForSigning writes the signed fields (along with the server and machine
+// public keys) to w needed to sign or verify a RegsterRequest.
+func (req *RegisterRequest) WritePlaintextForSigning(
+	w io.Writer, serverURL string, serverPubKey, machinePubKey wgkey.Key) error {
+	tsGob, err := req.Timestamp.GobEncode()
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write(tsGob); err != nil {
+		return err
+	}
+
+	if _, err := w.Write([]byte(serverURL)); err != nil {
+		return err
+	}
+
+	if _, err := w.Write(req.DeviceCert); err != nil {
+		return err
+	}
+
+	if _, err := w.Write(serverPubKey[:]); err != nil {
+		return err
+	}
+	if _, err := w.Write(machinePubKey[:]); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // RegisterResponse is returned by the server in response to a RegisterRequest.
